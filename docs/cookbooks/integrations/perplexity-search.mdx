@@ -1,0 +1,305 @@
+---
+title: Personalized Search with Perplexity
+description: "Combine Perplexity Search API web results with personal context stored in Mem0."
+---
+
+<Info icon="cloud">
+**Works with:** Mem0 Platform (`MemoryClient`)
+</Info>
+
+Imagine asking a search assistant for "coffee shops nearby" and, instead of generic results, getting cafes with WiFi in your city because it remembers you mentioned working remotely before. Or when you search for "lunchbox ideas for kids" it knows you have a 7-year-old daughter with a peanut allergy and searches for peanut-free options.
+
+That's what we are going to build in this cookbook: a personalized search assistant that uses Mem0 for memory and the [Perplexity Search API](https://docs.perplexity.ai/docs/search/quickstart) for web search.
+
+## Why Personalized Search
+
+Most assistants treat every query like they've never seen you before. That means repeating yourself about your location, diet, or preferences, and getting generic results.
+
+- Mem0 stores what the user has said about their location, diet, family, and preferences.
+- The Perplexity Search API returns ranked web results, each with a title, URL, snippet, and an optional date.
+
+The agent combines the two: it rewrites the query with the stored context before searching.
+
+## Prerequisites
+
+Before you begin, make sure you have:
+
+1. Installed the dependencies:
+```bash
+pip install langchain mem0ai perplexityai langchain-openai python-dotenv
+```
+
+2. Set up your API keys in a .env file:
+```bash
+OPENAI_API_KEY=your-openai-key
+PERPLEXITY_API_KEY=your-perplexity-key
+MEM0_API_KEY=your-mem0-key
+```
+
+## Code Walkthrough
+Let's break down the main components.
+
+### 1: Initialize Mem0 with Custom Instructions
+
+We configure Mem0 with custom instructions that guide it to infer user memories tailored specifically for our use case.
+
+<Warning>
+`project.update(custom_instructions=...)` changes the settings of the Mem0 project your `MEM0_API_KEY` belongs to, not just the memories for one user. Run this cookbook against a dedicated test project.
+</Warning>
+
+```python
+from dotenv import load_dotenv
+from mem0 import MemoryClient
+
+load_dotenv()
+
+mem0_client = MemoryClient()
+
+mem0_client.project.update(
+    custom_instructions='''
+INFER THE MEMORIES FROM USER QUERIES EVEN IF IT'S A QUESTION.
+
+We are building personalized search for which we need to understand about user's preferences and life
+and extract facts and memories accordingly.
+'''
+)
+```
+`load_dotenv()` reads the `.env` file from the previous step so `MemoryClient()`, `ChatOpenAI()`, and the Perplexity client can find their keys. Now, if a user casually mentions "I need to pick up my daughter" or "What's the weather at Los Angeles", Mem0 stores that they have a daughter or that Los Angeles is relevant to them. These details are used in later searches.
+
+### 2. Create the Perplexity Search Tool
+
+The Perplexity Python library reads `PERPLEXITY_API_KEY` from the environment. We wrap `search.create` in a LangChain tool so the agent can call it with an enhanced query. The response is mapped to a plain dict of `title`, `url`, `content`, and an optional `date` per result. `timeout=30.0` bounds each request (the library default is 900 seconds) while keeping the library's built-in retries. API errors (401 for a bad key, 422 for an invalid request, 429 for rate limits) are returned to the agent as a tool result with an `error` field instead of aborting the run. The error text names only the exception class and HTTP status; the API response body is never copied into it, so it cannot echo request details.
+
+```python
+import os
+
+from langchain_core.tools import tool
+from perplexity import APIError, Perplexity
+
+perplexity_client = Perplexity(
+    api_key=os.environ.get("PERPLEXITY_API_KEY"),
+    timeout=30.0,
+    default_headers={
+        "X-Pplx-Integration": "mem0",
+        "User-Agent": "mem0-personalized-search-example",
+    },
+)
+
+
+@tool
+def perplexity_search(query: str, max_results: int = 10) -> dict:
+    """Search the web with the Perplexity Search API.
+
+    Args:
+        query: The search query. Include location, dietary, or family context when it is relevant.
+        max_results: Number of results to return, between 1 and 20.
+
+    Returns a dict with the query and a list of results. Each result has title, url, content (snippet), and date (None when the API omits it).
+    """
+    max_results = max(1, min(max_results, 20))
+    try:
+        response = perplexity_client.search.create(query=query, max_results=max_results)
+    except APIError as e:
+        # Build the message from the exception class and HTTP status only; never include the response body.
+        status_code = getattr(e, "status_code", None)
+        reason = f"{type(e).__name__} (HTTP {status_code})" if status_code else type(e).__name__
+        return {"query": query, "error": f"Perplexity Search API request failed: {reason}"}
+
+    results = [
+        {"title": r.title, "url": r.url, "content": r.snippet, "date": r.date}
+        for r in response.results
+    ]
+
+    return {"query": query, "results": results}
+```
+
+### 3. Simulating User History
+To test personalization, we preload some sample conversation history for a user. Platform `add()` is asynchronous: it returns `{"event_id": ..., "status": "PENDING"}` and extracts memories in the background, so we poll each event until it has `SUCCEEDED` before searching. If any event reports `FAILED`, or any is still pending after the timeout, `wait_for_events` raises and the script stops instead of searching against incomplete memories.
+
+```python
+import time
+
+import httpx
+
+
+def wait_for_events(event_ids, timeout=60):
+    pending = set(event_ids)
+    failed = []
+    deadline = time.monotonic() + timeout
+
+    def seconds_left():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            detail = f"pending: {sorted(pending)}" if pending else "the last response arrived after the deadline"
+            raise RuntimeError(f"memory add events did not all reach SUCCEEDED within {timeout}s ({detail})")
+        return remaining
+
+    while pending:
+        for event_id in sorted(pending):
+            # Re-check the budget before every request and bound the request by what is left
+            # (the Mem0 client's own default timeout is 300s)
+            try:
+                event = mem0_client.client.get(f"/v1/event/{event_id}/", timeout=seconds_left())
+            except httpx.TimeoutException:
+                raise RuntimeError(f"polling memory add event {event_id} exceeded the {timeout}s budget") from None
+            event.raise_for_status()
+            status = event.json().get("status")
+            if status == "SUCCEEDED":
+                pending.discard(event_id)
+            elif status == "FAILED":
+                failed.append(event_id)
+        if failed:
+            raise RuntimeError(f"{len(failed)} memory add event(s) FAILED: {sorted(failed)}")
+        if pending:
+            time.sleep(min(1, seconds_left()))
+
+    # A SUCCEEDED response that arrives after the deadline does not count
+    seconds_left()
+
+
+def setup_user_history(user_id):
+    conversations = [
+        [{"role": "user", "content": "What will be the weather today at Los Angeles? I need to pick up my daughter from office."},
+         {"role": "assistant", "content": "I'll check the weather in LA for you."}],
+        [{"role": "user", "content": "I'm looking for vegan restaurants in Santa Monica"},
+         {"role": "assistant", "content": "I'll find vegan options in Santa Monica."}],
+        [{"role": "user", "content": "My 7-year-old daughter is allergic to peanuts"},
+         {"role": "assistant", "content": "I'll remember to check for peanut-free options."}],
+        [{"role": "user", "content": "I work remotely and need coffee shops with good wifi"},
+         {"role": "assistant", "content": "I'll find remote-work-friendly coffee shops."}],
+        [{"role": "user", "content": "We love hiking and outdoor activities on weekends"},
+         {"role": "assistant", "content": "Great! I'll keep your outdoor activity preferences in mind."}],
+    ]
+
+    event_ids = []
+    for conversation in conversations:
+        response = mem0_client.add(conversation, user_id=user_id)
+        if response.get("event_id"):
+            event_ids.append(response["event_id"])
+
+    wait_for_events(event_ids)
+```
+This gives the agent a baseline of the user's lifestyle and needs. `mem0_client.client` is the `MemoryClient`'s authenticated `httpx` session, so the poll reuses the Mem0 key you already configured.
+
+### 4. Retrieving User Context from Memory
+When a user makes a new search query, we retrieve relevant memories to enhance the search query:
+
+```python
+def get_user_context(user_id, query):
+    # For Platform API, user_id goes in filters
+    filters = {"user_id": user_id}
+    user_memories = mem0_client.search(query=query, filters=filters).get("results", [])
+
+    if user_memories:
+        context = "\n".join([f"- {memory['memory']}" for memory in user_memories])
+        return context
+    else:
+        return "No previous user context available."
+```
+This context is injected into the search agent so results are personalized.
+
+### 5. Creating the Personalized Search Agent
+The prompt asks the agent to rewrite the query with the user context before calling `perplexity_search`:
+
+```python
+from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4.1-nano-2025-04-14", temperature=0.2)
+
+
+def create_personalized_search_agent(user_context):
+    system_prompt = f"""You are a personalized search assistant.
+
+USER CONTEXT AND PREFERENCES:
+{user_context}
+
+YOUR ROLE:
+1. Analyze the user's query and context.
+2. Enhance the query with relevant personal memories.
+3. Always use perplexity_search for results.
+4. Explain which memories influenced personalization.
+"""
+
+    return create_agent(model=llm, tools=[perplexity_search], system_prompt=system_prompt)
+```
+
+### 6. Store New Interactions
+Every new query/response pair is stored for future personalization:
+
+```python
+def store_search_interaction(user_id, original_query, agent_response):
+    interaction = [
+        {"role": "user", "content": f"Searched for: {original_query}"},
+        {"role": "assistant", "content": f"Results based on preferences: {agent_response}"}
+    ]
+    mem0_client.add(messages=interaction, user_id=user_id)
+```
+
+### 7. Run a Personalized Search
+The workflow ties everything together: fetch context, run the agent, store the interaction, return the answer.
+
+```python
+from langchain_core.messages import HumanMessage
+
+
+def conduct_personalized_search(user_id, query):
+    user_context = get_user_context(user_id, query)
+    agent = create_personalized_search_agent(user_context)
+
+    response = agent.invoke({"messages": [HumanMessage(content=query)]})
+    agent_response = response["messages"][-1].content
+
+    store_search_interaction(user_id, query, agent_response)
+    return {"agent_response": agent_response}
+```
+
+### Full Example Run
+
+```python
+if __name__ == "__main__":
+    user_id = "john"
+    setup_user_history(user_id)
+
+    queries = [
+        "good coffee shops nearby for working",
+        "what can I make for my kid in lunch?"
+    ]
+
+    for q in queries:
+        results = conduct_personalized_search(user_id, q)
+        print(f"\nQuery: {q}")
+        print(f"Personalized Response: {results['agent_response']}")
+```
+
+## How It Works in Practice
+
+Here's how a run plays out:
+
+- **Context Gathering**: The user previously mentioned living in Los Angeles, looking for vegan restaurants, and having a 7-year-old daughter with a peanut allergy.
+- **Enhanced Search Query**:
+  - Query: "good coffee shops nearby for working"
+  - Enhanced Query: "coffee shops in Los Angeles with WiFi for remote work"
+- **Search Results**: The agent calls `perplexity_search` with the enhanced query and summarizes the returned results, each of which has a title, URL, snippet, and an optional date.
+- **Memory Update**: The query and answer are stored so later searches can use them.
+
+## Conclusion
+
+With Mem0 and the Perplexity Search API, you can build a search assistant that rewrites queries with what it has stored about the user before searching the web.
+
+The same pattern applies to shopping, travel, or daily-life queries: store what the user says, retrieve it at query time, and pass it to the search tool.
+
+Full Code: [Personalized Search with Perplexity GitHub](https://github.com/mem0ai/mem0/blob/main/examples/misc/personalized_search_perplexity.py)
+
+---
+
+<CardGroup cols={2}>
+  <Card title="Search with Personal Context" icon="search" href="/cookbooks/integrations/tavily-search">
+    The same personalized search pattern built on Tavily.
+  </Card>
+  <Card title="Deep Research with Mem0" icon="magnifying-glass" href="/cookbooks/operations/deep-research">
+    Build comprehensive research agents that remember findings across sessions.
+  </Card>
+</CardGroup>
+
+<Snippet file="star-on-github.mdx" />
