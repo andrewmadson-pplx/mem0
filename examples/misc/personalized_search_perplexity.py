@@ -5,6 +5,7 @@ Uses LangChain agent pattern with a Perplexity Search API tool for personalized 
 
 import logging
 import os
+import time
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -12,7 +13,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from perplexity import Perplexity
+from perplexity import APIError, Perplexity
 
 from mem0 import MemoryClient
 
@@ -27,15 +28,18 @@ logger = logging.getLogger(__name__)
 mem0_client = MemoryClient()
 
 # Perplexity Search API client. Reads PERPLEXITY_API_KEY and tags requests so Perplexity can attribute mem0 usage.
+# timeout bounds each request (the library default is 900s); the library's own retries (2) are kept.
 perplexity_client = Perplexity(
     api_key=os.environ.get("PERPLEXITY_API_KEY"),
+    timeout=30.0,
     default_headers={
         "X-Pplx-Integration": "mem0",
         "User-Agent": "mem0-personalized-search-example",
     },
 )
 
-# Set custom instructions to infer facts and memory to understand user preferences
+# Set custom instructions to infer facts and memory to understand user preferences.
+# This updates the settings of the Mem0 project your MEM0_API_KEY belongs to, so use a dedicated test project.
 mem0_client.project.update(
     custom_instructions="""
 INFER THE MEMORIES FROM USER QUERIES EVEN IF IT'S A QUESTION.
@@ -62,7 +66,13 @@ def perplexity_search(query: str, max_results: int = 10) -> dict:
     """
     # The Search API accepts 1 to 20 results per request
     max_results = max(1, min(max_results, 20))
-    response = perplexity_client.search.create(query=query, max_results=max_results)
+    try:
+        response = perplexity_client.search.create(query=query, max_results=max_results)
+    except APIError as e:
+        # 401 (bad key), 422 (invalid request), 429 (rate limit) and connection errors come back to the agent
+        # as a tool result instead of aborting the run. The message never includes the API key.
+        logger.error(f"Perplexity Search API error for query '{query}': {type(e).__name__}: {e.message}")
+        return {"query": query, "error": f"{type(e).__name__}: {e.message}"}
 
     results = [
         {
@@ -112,8 +122,35 @@ def setup_user_history(user_id):
     ]
 
     logger.info(f"Setting up user history for {user_id}")
+    event_ids = []
     for conversation in conversations:
-        mem0_client.add(conversation, user_id=user_id)
+        # Platform add() is asynchronous: it returns {"event_id": ..., "status": "PENDING"} and extracts memories later
+        response = mem0_client.add(conversation, user_id=user_id)
+        if response.get("event_id"):
+            event_ids.append(response["event_id"])
+
+    wait_for_events(event_ids)
+
+
+def wait_for_events(event_ids, timeout=60):
+    """Poll GET /v1/event/{event_id}/ until every add() event has SUCCEEDED or FAILED, so searches see the memories"""
+    pending = set(event_ids)
+    deadline = time.monotonic() + timeout
+    while pending and time.monotonic() < deadline:
+        for event_id in list(pending):
+            event = mem0_client.client.get(f"/v1/event/{event_id}/")
+            event.raise_for_status()
+            if event.json().get("status") in ("SUCCEEDED", "FAILED"):
+                pending.discard(event_id)
+        if pending:
+            time.sleep(1)
+
+    if pending:
+        logger.warning(
+            f"{len(pending)} memory add events still pending after {timeout}s; search results may be incomplete"
+        )
+    else:
+        logger.info(f"All {len(event_ids)} memory add events completed")
 
 
 def get_user_context(user_id, query):
