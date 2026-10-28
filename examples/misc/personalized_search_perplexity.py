@@ -8,6 +8,7 @@ import os
 import time
 from datetime import datetime
 
+import httpx
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
@@ -62,7 +63,7 @@ def perplexity_search(query: str, max_results: int = 10) -> dict:
         query: The search query. Include location, dietary, or family context when it is relevant.
         max_results: Number of results to return, between 1 and 20.
 
-    Returns a dict with the query and a list of results. Each result has title, url, content (snippet), and date.
+    Returns a dict with the query and a list of results. Each result has title, url, content (snippet), and date (None when the API omits it).
     """
     # The Search API accepts 1 to 20 results per request
     max_results = max(1, min(max_results, 20))
@@ -70,9 +71,13 @@ def perplexity_search(query: str, max_results: int = 10) -> dict:
         response = perplexity_client.search.create(query=query, max_results=max_results)
     except APIError as e:
         # 401 (bad key), 422 (invalid request), 429 (rate limit) and connection errors come back to the agent
-        # as a tool result instead of aborting the run. The message never includes the API key.
-        logger.error(f"Perplexity Search API error for query '{query}': {type(e).__name__}: {e.message}")
-        return {"query": query, "error": f"{type(e).__name__}: {e.message}"}
+        # as a tool result instead of aborting the run. The message is built only from the exception class and
+        # the HTTP status; the response body is never included because it can echo request details.
+        status_code = getattr(e, "status_code", None)
+        reason = f"{type(e).__name__} (HTTP {status_code})" if status_code else type(e).__name__
+        message = f"Perplexity Search API request failed: {reason}"
+        logger.error(f"{message} for query '{query}'")
+        return {"query": query, "error": message}
 
     results = [
         {
@@ -133,24 +138,44 @@ def setup_user_history(user_id):
 
 
 def wait_for_events(event_ids, timeout=60):
-    """Poll GET /v1/event/{event_id}/ until every add() event has SUCCEEDED or FAILED, so searches see the memories"""
+    """Poll GET /v1/event/{event_id}/ until every add() event has SUCCEEDED.
+
+    Raises RuntimeError if any event FAILED or if the events have not all succeeded within `timeout` seconds,
+    so a search never runs against incomplete memories.
+    """
     pending = set(event_ids)
+    failed = []
+    timed_out = False
     deadline = time.monotonic() + timeout
-    while pending and time.monotonic() < deadline:
+    while pending and not failed and not timed_out:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
         for event_id in list(pending):
-            event = mem0_client.client.get(f"/v1/event/{event_id}/")
+            try:
+                # Each request is bounded by the time left in the budget (the Mem0 client's own default is 300s)
+                event = mem0_client.client.get(f"/v1/event/{event_id}/", timeout=remaining)
+            except httpx.TimeoutException:
+                timed_out = True
+                break
             event.raise_for_status()
-            if event.json().get("status") in ("SUCCEEDED", "FAILED"):
+            status = event.json().get("status")
+            if status == "SUCCEEDED":
                 pending.discard(event_id)
-        if pending:
+            elif status == "FAILED":
+                pending.discard(event_id)
+                failed.append(event_id)
+        if pending and not failed and not timed_out:
             time.sleep(1)
 
+    if failed:
+        raise RuntimeError(f"{len(failed)} memory add event(s) FAILED: {sorted(failed)}")
     if pending:
-        logger.warning(
-            f"{len(pending)} memory add events still pending after {timeout}s; search results may be incomplete"
+        raise RuntimeError(
+            f"{len(pending)} memory add event(s) did not reach SUCCEEDED within {timeout}s: {sorted(pending)}"
         )
-    else:
-        logger.info(f"All {len(event_ids)} memory add events completed")
+    logger.info(f"All {len(event_ids)} memory add events SUCCEEDED")
 
 
 def get_user_context(user_id, query):
