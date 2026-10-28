@@ -145,36 +145,36 @@ def wait_for_events(event_ids, timeout=60):
     """
     pending = set(event_ids)
     failed = []
-    timed_out = False
     deadline = time.monotonic() + timeout
-    while pending and not failed and not timed_out:
+
+    def seconds_left():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            timed_out = True
-            break
-        for event_id in list(pending):
+            detail = f"pending: {sorted(pending)}" if pending else "the last response arrived after the deadline"
+            raise RuntimeError(f"memory add events did not all reach SUCCEEDED within {timeout}s ({detail})")
+        return remaining
+
+    while pending:
+        for event_id in sorted(pending):
+            # Re-check the budget before every request and bound the request by what is left
+            # (the Mem0 client's own default timeout is 300s)
             try:
-                # Each request is bounded by the time left in the budget (the Mem0 client's own default is 300s)
-                event = mem0_client.client.get(f"/v1/event/{event_id}/", timeout=remaining)
+                event = mem0_client.client.get(f"/v1/event/{event_id}/", timeout=seconds_left())
             except httpx.TimeoutException:
-                timed_out = True
-                break
+                raise RuntimeError(f"polling memory add event {event_id} exceeded the {timeout}s budget") from None
             event.raise_for_status()
             status = event.json().get("status")
             if status == "SUCCEEDED":
                 pending.discard(event_id)
             elif status == "FAILED":
-                pending.discard(event_id)
                 failed.append(event_id)
-        if pending and not failed and not timed_out:
-            time.sleep(1)
+        if failed:
+            raise RuntimeError(f"{len(failed)} memory add event(s) FAILED: {sorted(failed)}")
+        if pending:
+            time.sleep(min(1, seconds_left()))
 
-    if failed:
-        raise RuntimeError(f"{len(failed)} memory add event(s) FAILED: {sorted(failed)}")
-    if pending:
-        raise RuntimeError(
-            f"{len(pending)} memory add event(s) did not reach SUCCEEDED within {timeout}s: {sorted(pending)}"
-        )
+    # A SUCCEEDED response that arrives after the deadline does not count
+    seconds_left()
     logger.info(f"All {len(event_ids)} memory add events SUCCEEDED")
 
 
