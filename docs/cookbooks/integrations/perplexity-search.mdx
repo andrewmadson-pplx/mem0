@@ -16,7 +16,7 @@ That's what we are going to build in this cookbook: a personalized search assist
 Most assistants treat every query like they've never seen you before. That means repeating yourself about your location, diet, or preferences, and getting generic results.
 
 - Mem0 stores what the user has said about their location, diet, family, and preferences.
-- The Perplexity Search API returns ranked web results, each with a title, URL, snippet, and date.
+- The Perplexity Search API returns ranked web results, each with a title, URL, snippet, and an optional date.
 
 The agent combines the two: it rewrites the query with the stored context before searching.
 
@@ -68,7 +68,7 @@ and extract facts and memories accordingly.
 
 ### 2. Create the Perplexity Search Tool
 
-The Perplexity Python library reads `PERPLEXITY_API_KEY` from the environment. We wrap `search.create` in a LangChain tool so the agent can call it with an enhanced query. The response is mapped to a plain dict of `title`, `url`, `content`, and `date` per result. `timeout=30.0` bounds each request (the library default is 900 seconds) while keeping the library's built-in retries. API errors (401 for a bad key, 422 for an invalid request, 429 for rate limits) are returned to the agent as a tool result with an `error` field instead of aborting the run.
+The Perplexity Python library reads `PERPLEXITY_API_KEY` from the environment. We wrap `search.create` in a LangChain tool so the agent can call it with an enhanced query. The response is mapped to a plain dict of `title`, `url`, `content`, and an optional `date` per result. `timeout=30.0` bounds each request (the library default is 900 seconds) while keeping the library's built-in retries. API errors (401 for a bad key, 422 for an invalid request, 429 for rate limits) are returned to the agent as a tool result with an `error` field instead of aborting the run. The error text names only the exception class and HTTP status; the API response body is never copied into it, so it cannot echo request details.
 
 ```python
 import os
@@ -94,13 +94,16 @@ def perplexity_search(query: str, max_results: int = 10) -> dict:
         query: The search query. Include location, dietary, or family context when it is relevant.
         max_results: Number of results to return, between 1 and 20.
 
-    Returns a dict with the query and a list of results. Each result has title, url, content (snippet), and date.
+    Returns a dict with the query and a list of results. Each result has title, url, content (snippet), and date (None when the API omits it).
     """
     max_results = max(1, min(max_results, 20))
     try:
         response = perplexity_client.search.create(query=query, max_results=max_results)
     except APIError as e:
-        return {"query": query, "error": f"{type(e).__name__}: {e.message}"}
+        # Build the message from the exception class and HTTP status only; never include the response body.
+        status_code = getattr(e, "status_code", None)
+        reason = f"{type(e).__name__} (HTTP {status_code})" if status_code else type(e).__name__
+        return {"query": query, "error": f"Perplexity Search API request failed: {reason}"}
 
     results = [
         {"title": r.title, "url": r.url, "content": r.snippet, "date": r.date}
@@ -111,23 +114,47 @@ def perplexity_search(query: str, max_results: int = 10) -> dict:
 ```
 
 ### 3. Simulating User History
-To test personalization, we preload some sample conversation history for a user. Platform `add()` is asynchronous: it returns `{"event_id": ..., "status": "PENDING"}` and extracts memories in the background, so we poll each event until it settles before searching.
+To test personalization, we preload some sample conversation history for a user. Platform `add()` is asynchronous: it returns `{"event_id": ..., "status": "PENDING"}` and extracts memories in the background, so we poll each event until it has `SUCCEEDED` before searching. If any event reports `FAILED`, or any is still pending after the timeout, `wait_for_events` raises and the script stops instead of searching against incomplete memories.
 
 ```python
 import time
 
+import httpx
+
 
 def wait_for_events(event_ids, timeout=60):
     pending = set(event_ids)
+    failed = []
+    timed_out = False
     deadline = time.monotonic() + timeout
-    while pending and time.monotonic() < deadline:
+    while pending and not failed and not timed_out:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
         for event_id in list(pending):
-            event = mem0_client.client.get(f"/v1/event/{event_id}/")
+            try:
+                # Each request is bounded by the time left in the budget (the Mem0 client's own default is 300s)
+                event = mem0_client.client.get(f"/v1/event/{event_id}/", timeout=remaining)
+            except httpx.TimeoutException:
+                timed_out = True
+                break
             event.raise_for_status()
-            if event.json().get("status") in ("SUCCEEDED", "FAILED"):
+            status = event.json().get("status")
+            if status == "SUCCEEDED":
                 pending.discard(event_id)
-        if pending:
+            elif status == "FAILED":
+                pending.discard(event_id)
+                failed.append(event_id)
+        if pending and not failed and not timed_out:
             time.sleep(1)
+
+    if failed:
+        raise RuntimeError(f"{len(failed)} memory add event(s) FAILED: {sorted(failed)}")
+    if pending:
+        raise RuntimeError(
+            f"{len(pending)} memory add event(s) did not reach SUCCEEDED within {timeout}s: {sorted(pending)}"
+        )
 
 
 def setup_user_history(user_id):
@@ -253,7 +280,7 @@ Here's how a run plays out:
 - **Enhanced Search Query**:
   - Query: "good coffee shops nearby for working"
   - Enhanced Query: "coffee shops in Los Angeles with WiFi for remote work"
-- **Search Results**: The agent calls `perplexity_search` with the enhanced query and summarizes the returned results, each of which has a title, URL, snippet, and date.
+- **Search Results**: The agent calls `perplexity_search` with the enhanced query and summarizes the returned results, each of which has a title, URL, snippet, and an optional date.
 - **Memory Update**: The query and answer are stored so later searches can use them.
 
 ## Conclusion
