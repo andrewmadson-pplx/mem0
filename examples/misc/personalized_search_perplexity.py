@@ -1,6 +1,7 @@
 """
-Personalized Search Agent with Mem0 + Perplexity Search API
-Uses LangChain agent pattern with a Perplexity Search API tool for personalized search based on user memories stored in Mem0.
+Run two web searches using user memories from Mem0.
+Requires OPENAI_API_KEY, MEM0_API_KEY, and PERPLEXITY_API_KEY.
+Importing this module updates the selected Mem0 project's custom instructions.
 """
 
 import logging
@@ -18,18 +19,15 @@ from perplexity import APIError, Perplexity
 
 from mem0 import MemoryClient
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Initialize clients
 mem0_client = MemoryClient()
 
 # Perplexity Search API client. Reads PERPLEXITY_API_KEY and tags requests so Perplexity can attribute mem0 usage.
-# timeout bounds each request (the library default is 900s); the library's own retries (2) are kept.
+# Reduce the library's default HTTP timeout for this interactive demo; retain its retries.
 perplexity_client = Perplexity(
     api_key=os.environ.get("PERPLEXITY_API_KEY"),
     timeout=30.0,
@@ -39,16 +37,12 @@ perplexity_client = Perplexity(
     },
 )
 
-# Set custom instructions to infer facts and memory to understand user preferences.
 # This updates the settings of the Mem0 project your MEM0_API_KEY belongs to, so use a dedicated test project.
 mem0_client.project.update(
     custom_instructions="""
-INFER THE MEMORIES FROM USER QUERIES EVEN IF IT'S A QUESTION.
-
-We are building the personalized search for which we need to understand about user's preferences and life
-and extract facts and memories out of it accordingly.
-
-BE IT TIME, LOCATION, USER'S PERSONAL LIFE, CHOICES, USER'S PREFERENCES, we need to store those for better personalized search.
+Extract facts the user explicitly states, including facts within questions.
+Focus on location, dietary restrictions, family details, work needs, and interests.
+Do not infer where a user lives from a question about the weather in a city.
 """
 )
 
@@ -63,20 +57,22 @@ def perplexity_search(query: str, max_results: int = 10) -> dict:
         query: The search query. Include location, dietary, or family context when it is relevant.
         max_results: Number of results to return, between 1 and 20.
 
-    Returns a dict with the query and a list of results. Each result has title, url, content (snippet), and date (None when the API omits it).
+    On success, return {"query", "results"}; each result contains title, url, content, and date (None when omitted).
+    On API failure, return {"query", "error"} with a fixed recovery message.
     """
     # The Search API accepts 1 to 20 results per request
     max_results = max(1, min(max_results, 20))
     try:
         response = perplexity_client.search.create(query=query, max_results=max_results)
     except APIError as e:
-        # 401 (bad key), 422 (invalid request), 429 (rate limit) and connection errors come back to the agent
-        # as a tool result instead of aborting the run. The message is built only from the exception class and
-        # the HTTP status; the response body is never included because it can echo request details.
+        # Fixed message per status; the response body is never forwarded to the agent or the log.
         status_code = getattr(e, "status_code", None)
-        reason = f"{type(e).__name__} (HTTP {status_code})" if status_code else type(e).__name__
-        message = f"Perplexity Search API request failed: {reason}"
-        logger.error(f"{message} for query '{query}'")
+        message = {
+            401: "Perplexity authentication failed. Check PERPLEXITY_API_KEY.",
+            422: "Perplexity rejected the request. Check query and max_results.",
+            429: "Perplexity rate limit reached. Wait and retry.",
+        }.get(status_code, "Perplexity Search failed. Retry the request; if it still fails, check the service status.")
+        logger.error(message)
         return {"query": query, "error": message}
 
     results = [
@@ -93,17 +89,14 @@ def perplexity_search(query: str, max_results: int = 10) -> dict:
 
 
 def setup_user_history(user_id):
-    """Simulate realistic user conversation history"""
+    """Seed five conversations for user_id and wait for their ingestion events."""
     conversations = [
         [
             {
                 "role": "user",
-                "content": "What will be the weather today at Los Angeles? I need to go to pick up my daughter from office.",
+                "content": "I live in Los Angeles. What's the weather today? I need to pick up my daughter after work.",
             },
-            {
-                "role": "assistant",
-                "content": "I'll check the weather in LA for you, so that you can plan you daughter's pickup accordingly.",
-            },
+            {"role": "assistant", "content": "I'll check the weather in Los Angeles before your pickup."},
         ],
         [
             {"role": "user", "content": "I'm looking for vegan restaurants in Santa Monica"},
@@ -131,8 +124,7 @@ def setup_user_history(user_id):
     for conversation in conversations:
         # Platform add() is asynchronous: it returns {"event_id": ..., "status": "PENDING"} and extracts memories later
         response = mem0_client.add(conversation, user_id=user_id)
-        if response.get("event_id"):
-            event_ids.append(response["event_id"])
+        event_ids.append(response["event_id"])
 
     wait_for_events(event_ids)
 
@@ -151,7 +143,9 @@ def wait_for_events(event_ids, timeout=60):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             detail = f"pending: {sorted(pending)}" if pending else "the last response arrived after the deadline"
-            raise RuntimeError(f"memory add events did not all reach SUCCEEDED within {timeout}s ({detail})")
+            raise RuntimeError(
+                f"Mem0 ingestion did not finish within {timeout}s ({detail}). Check event status before retrying setup."
+            )
         return remaining
 
     while pending:
@@ -161,7 +155,9 @@ def wait_for_events(event_ids, timeout=60):
             try:
                 event = mem0_client.client.get(f"/v1/event/{event_id}/", timeout=seconds_left())
             except httpx.TimeoutException:
-                raise RuntimeError(f"polling memory add event {event_id} exceeded the {timeout}s budget") from None
+                raise RuntimeError(
+                    f"Polling Mem0 event {event_id} timed out. Check your connection and retry setup."
+                ) from None
             event.raise_for_status()
             status = event.json().get("status")
             if status == "SUCCEEDED":
@@ -169,7 +165,9 @@ def wait_for_events(event_ids, timeout=60):
             elif status == "FAILED":
                 failed.append(event_id)
         if failed:
-            raise RuntimeError(f"{len(failed)} memory add event(s) FAILED: {sorted(failed)}")
+            raise RuntimeError(
+                f"Mem0 ingestion failed for {sorted(failed)}. Check those events in Mem0 before retrying setup."
+            )
         if pending:
             time.sleep(min(1, seconds_left()))
 
@@ -179,7 +177,7 @@ def wait_for_events(event_ids, timeout=60):
 
 
 def get_user_context(user_id, query):
-    """Retrieve relevant user memories from Mem0"""
+    """Return matching memory text, or a fallback message when context is unavailable."""
     try:
         # For Platform API, user_id goes in filters
         filters = {"user_id": user_id}
@@ -193,69 +191,50 @@ def get_user_context(user_id, query):
             logger.info(f"No relevant memories found for user {user_id}")
             return "No previous user context available."
 
-    except Exception as e:
-        logger.error(f"Error retrieving user context: {e}")
-        return "Error retrieving user context."
+    except Exception:
+        logger.error("Mem0 lookup failed. Check MEM0_API_KEY and retry.")
+        return "Memory lookup failed; no user context is available."
 
 
 def create_personalized_search_agent(user_context):
-    """Create a LangChain agent for personalized search using the Perplexity Search API"""
+    """Bind the search tool to an agent with user_context in its system prompt."""
 
     tools = [perplexity_search]
 
-    # Create personalized search prompt
-    system_prompt = f"""You are a personalized search assistant. You help users find information that's relevant to their specific context and preferences.
+    system_prompt = f"""Use only the supplied memories to personalize web searches.
 
-USER CONTEXT AND PREFERENCES:
+USER MEMORIES:
 {user_context}
 
-YOUR ROLE:
-1. Analyze the user's query and their personal context/preferences above
-2. Look for patterns in the context to understand their preferences, location, lifestyle, family situation, etc.
-3. Create enhanced search queries that incorporate relevant personal context you discover
-4. Use the perplexity_search tool everytime with enhanced queries to find personalized results
+For each request:
+1. Add relevant location, dietary, family, or work context to the query.
+2. Call perplexity_search with that query.
+3. Summarize the results and explain which memories informed the query.
 
+Do not invent facts absent from the memories."""
 
-INSTRUCTIONS:
-- Study the user memories carefully to understand their situation
-- If any questions ask something related to nearby, close to, etc. refer to previous user context for identifying locations and enhance search query based on that.
-- If memories mention specific locations, consider them for local searches
-- If memories reveal dietary preferences or restrictions, factor those in for food-related queries
-- If memories show family context, consider family-friendly options
-- If memories indicate work style or interests, incorporate those when relevant
-- Use perplexity_search tool everytime with enhanced queries (based on above context)
-- Always explain which specific memories led you to personalize the search in certain ways
-
-Do NOT assume anything not present in the user memories."""
-
-    # Create agent
     agent = create_agent(model=llm, tools=tools, system_prompt=system_prompt)
 
     return agent
 
 
 def conduct_personalized_search(user_id, query):
-    """
-    Personalized search workflow using LangChain agent + Perplexity Search API + Mem0
+    """Return {"agent_response": ...} or a safe {"error": ...}.
 
-    Returns search results with user personalization details
+    Attempt to queue the query and answer in Mem0 after the agent finishes.
     """
     logger.info(f"Starting personalized search for user {user_id}: {query}")
     start_time = datetime.now()
 
     try:
-        # Get user context from Mem0
         user_context = get_user_context(user_id, query)
 
-        # Create personalized search agent
         agent = create_personalized_search_agent(user_context)
 
-        # Run the agent
         response = agent.invoke({"messages": [HumanMessage(content=query)]})
         messages = response["messages"]
         agent_response = messages[-1].content
 
-        # Log the enhanced search queries the agent sent to Perplexity
         search_queries_used = [
             tool_call["args"].get("query", "")
             for message in messages
@@ -265,10 +244,8 @@ def conduct_personalized_search(user_id, query):
         ]
         logger.info(f"Perplexity search queries used: {search_queries_used}")
 
-        # Store this search interaction in Mem0 for user preferences
         store_search_interaction(user_id, query, agent_response)
 
-        # Compile results
         duration = (datetime.now() - start_time).total_seconds()
 
         results = {"agent_response": agent_response}
@@ -276,13 +253,14 @@ def conduct_personalized_search(user_id, query):
         logger.info(f"Personalized search completed in {duration:.2f}s")
         return results
 
-    except Exception as e:
-        logger.error(f"Error in personalized search workflow: {e}")
-        return {"error": str(e)}
+    except Exception:
+        message = "Personalized search failed. Check provider credentials and retry."
+        logger.error(message)
+        return {"error": message}
 
 
 def store_search_interaction(user_id, original_query, agent_response):
-    """Store search interaction in Mem0 for future personalization"""
+    """Queue the query and answer for extraction; log a safe message if the write fails."""
     try:
         interaction = [
             {"role": "user", "content": f"Searched for: {original_query}"},
@@ -294,22 +272,20 @@ def store_search_interaction(user_id, original_query, agent_response):
 
         mem0_client.add(messages=interaction, user_id=user_id)
 
-        logger.info(f"Stored search interaction for user {user_id}")
+        logger.info(f"Queued search interaction for user {user_id}")
 
-    except Exception as e:
-        logger.error(f"Error storing search interaction: {e}")
+    except Exception:
+        logger.error("Mem0 interaction write failed. Check MEM0_API_KEY and retry.")
 
 
 def personalized_search_agent():
-    """Example of the personalized search agent"""
+    """Seed memories for john, then print answers to two example queries."""
 
     user_id = "john"
 
-    # Setup user history
     print("\nSetting up user history from past conversations...")
-    setup_user_history(user_id)  # This is one-time setup
+    setup_user_history(user_id)
 
-    # Test personalized searches
     test_queries = [
         "good coffee shops nearby for working",
         "what can we gift our daughter for birthday? what's trending?",
@@ -319,7 +295,6 @@ def personalized_search_agent():
         print(f"\n ----- {i}️⃣ PERSONALIZED SEARCH -----")
         print(f"Query: '{query}'")
 
-        # Run personalized search
         results = conduct_personalized_search(user_id, query)
 
         if results.get("error"):
